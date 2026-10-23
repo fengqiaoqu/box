@@ -187,6 +187,70 @@ The report leaves out two things, so check them in `box.toml`:
 - **The extra reach of a program with no tool table:** its file grants appear under `[agent]`, but
   the wider reach of its sandbox doesn't.
 
+<a id="dependency-read-startup-design"></a>
+### Dependency-read startup design
+
+**This is the accepted design, not implemented diagnostic output.**
+The Linux dependency walk already restricts reads from workload-writable chains.
+The corresponding macOS admission checks and grouped configuration guidance remain implementation work.
+The macOS renderer currently discovers dependency reads without that writable-chain admission check.
+
+The [read-derivation decision](decisions.md#box-derives-a-read-closure-and-refuses-to-derive-an-exec-closure)
+keeps discovery automatic but restricts a branch when the workload can change its executable, a library, or a resolution path.
+This includes replacement through writable parents and links.
+The restriction follows dependencies of dependencies, even when a later library is not writable.
+Existing content-read grants or existing trusted system-library allowances must cover reads on that branch.
+Write, Exec, metadata, and directory-listing permissions do not substitute for content Read on macOS.
+
+For a required dependency identified during `box run` startup, missing Read coverage must prevent the affected workload from starting.
+The command must return an error and report missing files together, with each requesting executable or library.
+The report must remove duplicate file entries and preserve existing entries in its suggested Read list.
+The operator reviews the suggestion and changes the configuration; Box does not edit it automatically.
+Explicit denials and protected-path refusals remain separate errors without suggestions to override them.
+
+For example, a writable program can need two libraries outside its readable project.
+The following illustrates the selected error message; it is not current output:
+
+```text
+strands-box: [agent] did not start.
+
+2 dependencies lack read access:
+  1. "/opt/vendor/libcodec.dylib"
+     Requested by: "/demo/project/bin/app" -> "/demo/project/lib/libproject.dylib"
+  2. "/opt/vendor/libstorage.dylib"
+     Requested by: "/demo/project/bin/app"
+
+If these dependencies are intended, use this read_file list
+in the existing [agent.filesystem] table. Existing entries are retained.
+read_file = [
+  "/demo/config/settings.json",
+  "/opt/vendor/libcodec.dylib",
+  "/opt/vendor/libstorage.dylib",
+]
+
+Each Read entry permits access to the file's complete contents.
+Discovery stopped at inaccessible dependencies; this list may be incomplete.
+No configuration files changed.
+```
+
+The example retains an existing settings-file entry and adds two library entries.
+A library already covered by an existing Read entry needs no individual entry.
+The report must use canonical paths, escape names correctly, and avoid suggesting a directory grant when a file entry suffices.
+If a path cannot be represented in the configuration, the report must say so.
+The [configuration reference](../user/config.md) defines the existing Read lists.
+
+Discovery must continue through other permitted branches, but it must not inspect refused files merely to complete the report.
+The report must state when the walk stops at an inaccessible dependency or a resource limit.
+Additional dependencies can appear after the operator grants access and retries.
+Libraries selected by application code after startup are outside this static discovery guarantee.
+Optional dependencies need separate loader tests before the design can promise continued operation without them.
+
+This choice preserves automatic reads for chains the workload cannot change.
+It does not establish that their contents have a trusted origin.
+Programs from earlier runs can remain outside this restriction after their files become read-only.
+For writable chains, package changes can require new Read entries, while directory Read entries expose more contents than exact-file entries.
+Production acceptance still requires refusal-before-launch tests, permitted build controls, and platform-specific path-replacement tests.
+
 <a id="the-agents-box-and-leaf-boxes"></a>
 ## The agent's sandbox and the sandboxes for tools and local MCP servers
 
