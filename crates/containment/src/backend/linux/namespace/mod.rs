@@ -8,6 +8,9 @@ pub(crate) mod syscall;
 pub(crate) mod view;
 
 #[cfg(test)]
+mod grant_identity_tests;
+
+#[cfg(test)]
 mod failure_tests;
 
 use crate::ContainmentConfig;

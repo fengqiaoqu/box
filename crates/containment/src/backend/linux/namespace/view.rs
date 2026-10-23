@@ -1,11 +1,12 @@
 //! Lowering filesystem grants onto a constructed mount view.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::ContainmentConfig;
 use crate::error::ContainmentError;
-use crate::model::{Operation, Scope};
+use crate::model::{ObjectIdentity, ObjectPin, Operation, Scope};
 
 use super::MECHANISM;
 
@@ -63,11 +64,25 @@ pub(crate) struct MountEntry {
 pub(crate) struct MountView {
     entries: Vec<MountEntry>,
     protected_parents: BTreeSet<PathBuf>,
+    grant_identities: BTreeMap<PathBuf, ObjectIdentity>,
+    grant_pins: Vec<ObjectPin>,
 }
 
 impl MountView {
     /// Plan the view from a request, without touching any namespace.
     pub(crate) fn plan(config: &ContainmentConfig) -> Result<Self, ContainmentError> {
+        let mut grant_identities = BTreeMap::new();
+        for granted in config.authorizations() {
+            if let Some(identity) = granted.identity
+                && let Some(previous) = grant_identities.insert(granted.resolved.clone(), identity)
+                && previous != identity
+            {
+                return Err(refusal(format!(
+                    "filesystem grants name different objects at '{}'",
+                    granted.resolved.display()
+                )));
+            }
+        }
         let mut entries = vec![MountEntry {
             source: None,
             target: PathBuf::from("/"),
@@ -435,6 +450,12 @@ impl MountView {
         Ok(Self {
             entries,
             protected_parents,
+            grant_identities,
+            grant_pins: config
+                .authorizations()
+                .iter()
+                .filter_map(|grant| grant.pin.clone())
+                .collect(),
         })
     }
 
@@ -496,7 +517,11 @@ impl MountView {
         )
         .map_err(|e| refusal(format!("remounting the view root read-only: {e}")))?;
 
-        self.pivot_into(root)
+        self.pivot_into(root)?;
+        for pin in &self.grant_pins {
+            pin.release()?;
+        }
+        Ok(())
     }
 
     /// Pin each protected parent before the root becomes read-only.
@@ -652,6 +677,20 @@ impl MountView {
                         entry.target.display()
                     ))
                 })?;
+                let expected = if matches!(entry.origin, MountOrigin::Grant | MountOrigin::Socket) {
+                    Some(*self.grant_identities.get(source).ok_or_else(|| {
+                        refusal(format!("missing grant identity for '{}'", source.display()))
+                    })?)
+                } else {
+                    None
+                };
+                let pinned = expected
+                    .map(|identity| pin_grant_source(source, identity))
+                    .transpose()?;
+                let pinned_path = pinned
+                    .as_ref()
+                    .map(|file| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())));
+                let mount_source = pinned_path.as_deref().unwrap_or(source);
 
                 // The mountpoint must match the source's kind: a file binds onto a
                 // file, a directory onto a directory.
@@ -669,7 +708,7 @@ impl MountView {
                         )));
                     }
                     Ok(())
-                } else if source.is_dir() {
+                } else if mount_source.is_dir() {
                     std::fs::create_dir_all(&target)
                 } else {
                     // An existing file is already its own mountpoint. A symbolic link an enclosing
@@ -712,7 +751,7 @@ impl MountView {
                 })?;
 
                 mount_syscall(
-                    Some(source),
+                    Some(mount_source),
                     &target,
                     None,
                     libc::MS_BIND | libc::MS_REC,
@@ -726,6 +765,9 @@ impl MountView {
                     ))
                 })?;
 
+                if let Some(identity) = expected {
+                    require_grant_identity(&target, identity)?;
+                }
                 if let MountOrigin::Protection { device, inode } = entry.origin {
                     require_mounted_identity(&target, device, inode)?;
                     remount_protected(&target)?;
@@ -744,7 +786,7 @@ impl MountView {
                     (true, false) => {
                         // W^X: a writable bind is the one surface whose bytes the workload chooses,
                         // so it must not also be executable.
-                        let is_device = std::fs::metadata(source)
+                        let is_device = std::fs::metadata(mount_source)
                             .map(|meta| {
                                 let kind = meta.file_type();
                                 std::os::unix::fs::FileTypeExt::is_char_device(&kind)
@@ -817,6 +859,53 @@ impl MountView {
 
         Ok(())
     }
+}
+
+fn pin_grant_source(
+    source: &Path,
+    expected: ObjectIdentity,
+) -> Result<std::fs::File, ContainmentError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| {
+            refusal(format!(
+                "opening grant source '{}': {error}",
+                source.display()
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        refusal(format!(
+            "inspecting grant source '{}': {error}",
+            source.display()
+        ))
+    })?;
+    if ObjectIdentity::from_metadata(&metadata) != expected {
+        return Err(refusal(format!(
+            "mounted grant identity changed before binding '{}'",
+            source.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn require_grant_identity(target: &Path, expected: ObjectIdentity) -> Result<(), ContainmentError> {
+    let metadata = std::fs::metadata(target).map_err(|error| {
+        refusal(format!(
+            "inspecting mounted grant '{}': {error}",
+            target.display()
+        ))
+    })?;
+    if ObjectIdentity::from_metadata(&metadata) != expected {
+        return Err(refusal(format!(
+            "mounted grant identity changed at '{}'",
+            target.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Remount `target` read-only, and every submount beneath it.
@@ -1414,7 +1503,7 @@ fn image_needs(executable: &Path) -> Result<ImageNeeds, ContainmentError> {
     let mut needed_offsets = Vec::new();
     let mut runpath_offsets = Vec::new();
     let mut rpath_offsets = Vec::new();
-    for entry in dynamic.chunks_exact(16) {
+    for entry in dynamic.as_chunks::<16>().0 {
         let tag = u64::from_le_bytes(entry[0..8].try_into().unwrap_or_default());
         let value = u64::from_le_bytes(entry[8..16].try_into().unwrap_or_default());
         match tag {
@@ -3293,6 +3382,8 @@ mod tests {
         let view = MountView {
             entries: Vec::new(),
             protected_parents: BTreeSet::new(),
+            grant_identities: BTreeMap::new(),
+            grant_pins: Vec::new(),
         };
         let mut entry = MountEntry {
             source: None,
@@ -3318,6 +3409,8 @@ mod tests {
         let view = MountView {
             entries: Vec::new(),
             protected_parents: BTreeSet::new(),
+            grant_identities: BTreeMap::new(),
+            grant_pins: Vec::new(),
         };
         let entry = MountEntry {
             source: Some(source),
@@ -3355,6 +3448,8 @@ mod tests {
         let view = MountView {
             entries: vec![parent],
             protected_parents: BTreeSet::new(),
+            grant_identities: BTreeMap::new(),
+            grant_pins: Vec::new(),
         };
         let entry = MountEntry {
             source: None,
@@ -3398,6 +3493,111 @@ mod tests {
         }
         std::fs::hard_link(&path, directory.path().join("alias")).unwrap();
         assert!(require_mounted_identity(&path, metadata.dev(), metadata.ino()).is_err());
+    }
+
+    #[test]
+    fn a_grant_mount_that_does_not_install_the_checked_object_is_refused() {
+        super::super::failure_tests::in_fresh_process(|| {
+            use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source");
+            std::fs::write(&source, b"granted").unwrap();
+            let identity = ObjectIdentity::from_metadata(&source.metadata().unwrap());
+            let view = MountView {
+                entries: Vec::new(),
+                protected_parents: BTreeSet::new(),
+                grant_identities: BTreeMap::from([(source.clone(), identity)]),
+                grant_pins: Vec::new(),
+            };
+            let entry = MountEntry {
+                source: Some(source),
+                target: PathBuf::from("/entry"),
+                kind: MountKind::Bind,
+                writable: true,
+                executable: false,
+                origin: MountOrigin::Grant,
+            };
+            // Report mount success without installing the object, so establish must inspect it.
+            let filter = SeccompFilter::new(
+                BTreeMap::from([(libc::SYS_mount, Vec::new())]),
+                SeccompAction::Allow,
+                SeccompAction::Errno(0),
+                std::env::consts::ARCH.try_into().unwrap(),
+            )
+            .unwrap();
+            let program: BpfProgram = filter.try_into().unwrap();
+            seccompiler::apply_filter(&program).unwrap();
+
+            let error = view.establish(&entry, root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("mounted grant identity changed"),
+                "{error}"
+            );
+            let target = root.path().join("entry");
+            assert_ne!(
+                ObjectIdentity::from_metadata(&target.metadata().unwrap()),
+                identity
+            );
+            assert_eq!(std::fs::read(target).unwrap(), b"");
+        });
+    }
+
+    #[test]
+    fn an_opened_grant_source_keeps_its_object_after_path_replacement() {
+        super::super::failure_tests::in_fresh_process_with_user_namespace(true, || {
+            let directory = tempfile::tempdir().unwrap();
+            for is_directory in [false, true] {
+                let root = directory
+                    .path()
+                    .join(if is_directory { "directory" } else { "file" });
+                std::fs::create_dir(&root).unwrap();
+                let source = root.join("source");
+                let target = root.join("target");
+                let replacement = root.join("replacement");
+                for path in [&source, &target, &replacement] {
+                    if is_directory {
+                        std::fs::create_dir(path).unwrap();
+                        std::fs::write(path.join("value"), path.as_os_str().as_encoded_bytes())
+                            .unwrap();
+                    } else {
+                        std::fs::write(path, path.as_os_str().as_encoded_bytes()).unwrap();
+                    }
+                }
+                let identity = ObjectIdentity::from_metadata(&source.metadata().unwrap());
+                let pinned = pin_grant_source(&source, identity).unwrap();
+                std::fs::rename(&source, root.join("held")).unwrap();
+                std::fs::rename(&replacement, &source).unwrap();
+                assert_ne!(
+                    ObjectIdentity::from_metadata(&source.metadata().unwrap()),
+                    identity
+                );
+                let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+                mount_syscall(
+                    Some(&pinned_path),
+                    &target,
+                    None,
+                    libc::MS_BIND | libc::MS_REC,
+                    None,
+                )
+                .unwrap();
+                require_grant_identity(&target, identity).unwrap();
+                let value = if is_directory {
+                    target.join("value")
+                } else {
+                    target.clone()
+                };
+                assert_eq!(
+                    std::fs::read(value).unwrap(),
+                    source.as_os_str().as_encoded_bytes()
+                );
+                let error = require_grant_identity(&source, identity).unwrap_err();
+                assert!(
+                    error.to_string().contains("mounted grant identity changed"),
+                    "{error}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -3548,6 +3748,8 @@ mod tests {
             let view = MountView {
                 entries: Vec::new(),
                 protected_parents: BTreeSet::new(),
+                grant_identities: BTreeMap::new(),
+                grant_pins: Vec::new(),
             };
             let error = view.pivot_into(&root).unwrap_err();
             assert!(
@@ -3602,6 +3804,10 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let source = root.path().join("source");
             std::fs::write(&source, b"source").unwrap();
+            let grant_identities = BTreeMap::from([(
+                source.clone(),
+                ObjectIdentity::from_metadata(&source.metadata().unwrap()),
+            )]);
             if create_empty_source {
                 std::fs::write(root.path().join(EMPTY_FILE_NAME), b"").unwrap();
             }
@@ -3620,8 +3826,15 @@ mod tests {
             let view = MountView {
                 entries: Vec::new(),
                 protected_parents: BTreeSet::new(),
+                grant_identities,
+                grant_pins: Vec::new(),
             };
-            super::super::failure_tests::refuse_syscall(denied_call, None);
+            let argument =
+                (kind == MountKind::Bind && denied_call == libc::SYS_openat).then_some((
+                    2,
+                    (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC) as u64,
+                ));
+            super::super::failure_tests::refuse_syscall(denied_call, argument);
             let error = view.establish(&entry, root.path()).unwrap_err();
             assert!(error.to_string().contains(reason), "{error}");
         });
@@ -3711,6 +3924,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::write(&source, b"source").unwrap();
+        let grant_identities = BTreeMap::from([(
+            source.clone(),
+            ObjectIdentity::from_metadata(&source.metadata().unwrap()),
+        )]);
         let target = root.path().join("entry");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("sentinel"), b"unchanged").unwrap();
@@ -3725,6 +3942,8 @@ mod tests {
         let view = MountView {
             entries: Vec::new(),
             protected_parents: BTreeSet::new(),
+            grant_identities,
+            grant_pins: Vec::new(),
         };
         let error = view.establish(&entry, root.path()).unwrap_err();
         assert!(
