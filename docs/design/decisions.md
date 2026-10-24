@@ -307,10 +307,13 @@ still goes through the egress gateway, which judges that traffic as the agent.
 
 Box keeps automatic dependency discovery and derives bounded runtime read roots.
 A dependency branch the workload can change requires existing content-read authority or existing trusted system-library allowances, subject to the floors.
-That restriction includes replaceable resolution paths and follows indirect dependencies, while chains outside the workload's write reach retain automatic derived reads.
+That restriction includes replaceable resolution paths and follows indirect dependencies.
+With a writable directory, Box also restricts multiply linked files because path checks cannot exclude a writable alias.
+Other chains outside the workload's write reach retain automatic derived reads.
 Box derives no exec permission from a dependency graph because it could authorize general-purpose helpers without an operator decision.
-The cost is that writable programs can require additional Read entries, while a previously malicious artifact that is now read-only remains outside this restriction.
-The [dependency startup design](containment.md#dependency-read-startup-design) states the selected operator experience and its remaining implementation work.
+The cost is additional Read entries for writable programs and for hard-linked files whose other names cannot be ruled out as writable.
+A previously malicious artifact that is now read-only can remain outside this restriction.
+The [dependency startup design](containment.md#dependency-read-startup-design) states the operator experience and the limits of static discovery.
 
 <a id="a-program-starts-through-its-route-and-is-granted-on-its-target"></a>
 ### A program starts through its route and is granted on its target
