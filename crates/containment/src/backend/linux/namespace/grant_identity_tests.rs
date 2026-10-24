@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use super::{NamespaceBackend, enter_namespaces, probe, view};
+use super::{NamespaceBackend, enter_namespaces, view};
 use crate::backend::ContainmentBackend as _;
 use crate::{ContainmentConfig, Operation, Scope};
 
@@ -121,15 +121,55 @@ impl Fixture {
 }
 
 fn supported() -> bool {
-    if probe::user_namespace_is_permitted() {
-        true
-    } else {
-        assert!(
-            std::env::var_os("SBOX58_REQUIRE_RUNTIME").is_none(),
-            "required Linux namespace support is unavailable"
-        );
-        eprintln!("skipping: user namespaces are unavailable");
-        false
+    let (code, report) = in_child(|| {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let prerequisites = || -> std::io::Result<()> {
+            // Probe host permissions independently of the production setup path.
+            // SAFETY: this isolated child exits without returning to the harness.
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            std::fs::write("/proc/self/setgroups", "deny")?;
+            std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+            std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+            // SAFETY: only this short-lived child changes namespaces.
+            if unsafe {
+                libc::unshare(
+                    libc::CLONE_NEWNS
+                        | libc::CLONE_NEWNET
+                        | libc::CLONE_NEWIPC
+                        | libc::CLONE_NEWUTS
+                        | libc::CLONE_NEWPID,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        match prerequisites() {
+            Ok(()) => STARTED,
+            Err(error) => {
+                eprintln!("namespace prerequisite: {error}");
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    77
+                } else {
+                    OTHER
+                }
+            }
+        }
+    });
+    match code {
+        STARTED => true,
+        77 => {
+            assert!(
+                std::env::var_os("SBOX58_REQUIRE_RUNTIME").is_none(),
+                "required Linux namespace support is unavailable: {report}"
+            );
+            eprintln!("skipping: Linux namespace prerequisites denied: {report}");
+            false
+        }
+        _ => panic!("unexpected namespace prerequisite failure: {code}: {report}"),
     }
 }
 
@@ -145,8 +185,17 @@ fn wait(child: libc::pid_t) -> i32 {
 }
 
 fn in_child(action: impl FnOnce() -> i32) -> (i32, String) {
+    let thread = std::thread::current();
+    assert!(
+        std::env::var("BOX_UNIT_SYSCALL_FAILURE_CHILD")
+            .ok()
+            .as_deref()
+            == thread.name()
+            || std::env::var_os("SBOX58_RACE_CHILD").is_some(),
+        "forking grant tests must first re-execute with --test-threads=1"
+    );
     let (mut reader, writer) = UnixStream::pair().unwrap();
-    // SAFETY: the child terminates with _exit and never returns to the harness.
+    // SAFETY: the isolated harness runs no sibling tests; the child exits with _exit.
     let child = unsafe { libc::fork() };
     assert!(child >= 0);
     if child == 0 {
@@ -169,8 +218,10 @@ fn in_child(action: impl FnOnce() -> i32) -> (i32, String) {
 
 #[test]
 fn a_child_panic_is_an_error() {
-    let result = in_child(|| panic!("synthetic child failure"));
-    assert_eq!(result.0, OTHER, "{result:?}");
+    super::failure_tests::in_fresh_process(|| {
+        let result = in_child(|| panic!("synthetic child failure"));
+        assert_eq!(result.0, OTHER, "{result:?}");
+    });
 }
 
 #[test]
@@ -241,51 +292,57 @@ fn materialize_after(
 
 #[test]
 fn unchanged_files_directories_and_sockets_start() {
-    if !supported() {
-        return;
-    }
-    for kind in [Kind::Directory, Kind::File, Kind::Socket] {
-        let result = materialize(&Fixture::new(kind), false, false);
-        assert_eq!(result.0, STARTED, "{kind:?}: {result:?}");
-        let fixture = Fixture::new(kind);
-        let result = apply(&fixture, &fixture.config(false));
-        assert_eq!(result.0, STARTED, "real apply {kind:?}: {result:?}");
-    }
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        for kind in [Kind::Directory, Kind::File, Kind::Socket] {
+            let result = materialize(&Fixture::new(kind), false, false);
+            assert_eq!(result.0, STARTED, "{kind:?}: {result:?}");
+            let fixture = Fixture::new(kind);
+            let result = apply(&fixture, &fixture.config(false));
+            assert_eq!(result.0, STARTED, "real apply {kind:?}: {result:?}");
+        }
+    });
 }
 
 #[test]
 fn swapped_files_directories_and_sockets_refuse_before_startup() {
-    if !supported() {
-        return;
-    }
-    for kind in [Kind::Directory, Kind::File, Kind::Socket] {
-        let result = materialize(&Fixture::new(kind), true, false);
-        println!("{kind:?}: {result:?}");
-        assert_eq!(result.0, REFUSED, "{kind:?}: {result:?}");
-        assert!(
-            result.1.contains("mounted grant identity changed"),
-            "unrelated refusal: {result:?}"
-        );
-    }
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        for kind in [Kind::Directory, Kind::File, Kind::Socket] {
+            let result = materialize(&Fixture::new(kind), true, false);
+            println!("{kind:?}: {result:?}");
+            assert_eq!(result.0, REFUSED, "{kind:?}: {result:?}");
+            assert!(
+                result.1.contains("mounted grant identity changed"),
+                "unrelated refusal: {result:?}"
+            );
+        }
+    });
 }
 
 #[test]
 fn same_path_object_replacements_refuse_before_startup() {
-    if !supported() {
-        return;
-    }
-    for kind in [Kind::Directory, Kind::File, Kind::Socket] {
-        let fixture = Fixture::new(kind);
-        let result = materialize_after(&fixture, false, || {
-            std::fs::rename(&fixture.grant, &fixture.held).unwrap();
-            std::fs::rename(&fixture.replacement, &fixture.grant).unwrap();
-        });
-        assert_eq!(result.0, REFUSED, "{kind:?}: {result:?}");
-        assert!(
-            result.1.contains("mounted grant identity changed"),
-            "{result:?}"
-        );
-    }
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        for kind in [Kind::Directory, Kind::File, Kind::Socket] {
+            let fixture = Fixture::new(kind);
+            let result = materialize_after(&fixture, false, || {
+                std::fs::rename(&fixture.grant, &fixture.held).unwrap();
+                std::fs::rename(&fixture.replacement, &fixture.grant).unwrap();
+            });
+            assert_eq!(result.0, REFUSED, "{kind:?}: {result:?}");
+            assert!(
+                result.1.contains("mounted grant identity changed"),
+                "{result:?}"
+            );
+        }
+    });
 }
 
 #[test]
@@ -344,26 +401,77 @@ fn a_prepared_object_stays_pinned_until_its_grant_is_applied() {
 
 #[test]
 fn read_only_and_writable_grants_keep_their_access_modes() {
-    if !supported() {
-        return;
-    }
-    for kind in [Kind::Directory, Kind::File] {
-        for writable in [false, true] {
-            let fixture = Fixture::new(kind);
-            let mut config = fixture.config(false);
-            let scope = match kind {
-                Kind::Directory => Scope::Root,
-                _ => Scope::File,
-            };
-            if writable {
-                config = config
-                    .allow(&fixture.grant, Operation::Write, scope)
-                    .unwrap();
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        for kind in [Kind::Directory, Kind::File] {
+            for writable in [false, true] {
+                let fixture = Fixture::new(kind);
+                let mut config = fixture.config(false);
+                let scope = match kind {
+                    Kind::Directory => Scope::Root,
+                    _ => Scope::File,
+                };
+                if writable {
+                    config = config
+                        .allow(&fixture.grant, Operation::Write, scope)
+                        .unwrap();
+                }
+                let path = match kind {
+                    Kind::Directory => fixture.grant.join("value"),
+                    _ => fixture.grant.clone(),
+                };
+                let result = in_child(|| {
+                    if let Err(error) =
+                        NamespaceBackend::with_probe_result(true).apply(&config, None, None)
+                    {
+                        let _ = writeln!(std::io::stderr(), "apply: {error}");
+                        return REFUSED;
+                    }
+                    if fixture.inspect() != STARTED {
+                        return OTHER;
+                    }
+                    if std::fs::write(&path, b"permitted write").is_ok() == writable {
+                        STARTED
+                    } else {
+                        OTHER
+                    }
+                });
+                assert_eq!(
+                    result.0, STARTED,
+                    "{kind:?} writable={writable}: {result:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    if writable {
+                        b"permitted write".as_slice()
+                    } else {
+                        GRANTED
+                    }
+                );
             }
-            let path = match kind {
-                Kind::Directory => fixture.grant.join("value"),
-                _ => fixture.grant.clone(),
-            };
+        }
+    });
+}
+
+#[test]
+fn unchanged_symlinks_and_hardlinks_preserve_permitted_reads() {
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        for symbolic in [false, true] {
+            let fixture = Fixture::new(Kind::File);
+            let alias = fixture._root.path().join("alias");
+            if symbolic {
+                std::os::unix::fs::symlink(&fixture.grant, &alias).unwrap();
+            } else {
+                std::fs::hard_link(&fixture.grant, &alias).unwrap();
+            }
+            let config = ContainmentConfig::new()
+                .allow(&alias, Operation::Read, Scope::File)
+                .unwrap();
             let result = in_child(|| {
                 if let Err(error) =
                     NamespaceBackend::with_probe_result(true).apply(&config, None, None)
@@ -371,77 +479,33 @@ fn read_only_and_writable_grants_keep_their_access_modes() {
                     let _ = writeln!(std::io::stderr(), "apply: {error}");
                     return REFUSED;
                 }
-                if fixture.inspect() != STARTED {
-                    return OTHER;
-                }
-                if std::fs::write(&path, b"permitted write").is_ok() == writable {
+                if std::fs::read(&alias).is_ok_and(|bytes| bytes == GRANTED)
+                    && std::fs::read(&fixture.replacement).is_err()
+                {
                     STARTED
                 } else {
                     OTHER
                 }
             });
-            assert_eq!(
-                result.0, STARTED,
-                "{kind:?} writable={writable}: {result:?}"
-            );
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                if writable {
-                    b"permitted write".as_slice()
-                } else {
-                    GRANTED
-                }
-            );
+            assert_eq!(result.0, STARTED, "symbolic={symbolic}: {result:?}");
         }
-    }
-}
-
-#[test]
-fn unchanged_symlinks_and_hardlinks_preserve_permitted_reads() {
-    if !supported() {
-        return;
-    }
-    for symbolic in [false, true] {
-        let fixture = Fixture::new(Kind::File);
-        let alias = fixture._root.path().join("alias");
-        if symbolic {
-            std::os::unix::fs::symlink(&fixture.grant, &alias).unwrap();
-        } else {
-            std::fs::hard_link(&fixture.grant, &alias).unwrap();
-        }
-        let config = ContainmentConfig::new()
-            .allow(&alias, Operation::Read, Scope::File)
-            .unwrap();
-        let result = in_child(|| {
-            if let Err(error) = NamespaceBackend::with_probe_result(true).apply(&config, None, None)
-            {
-                let _ = writeln!(std::io::stderr(), "apply: {error}");
-                return REFUSED;
-            }
-            if std::fs::read(&alias).is_ok_and(|bytes| bytes == GRANTED)
-                && std::fs::read(&fixture.replacement).is_err()
-            {
-                STARTED
-            } else {
-                OTHER
-            }
-        });
-        assert_eq!(result.0, STARTED, "symbolic={symbolic}: {result:?}");
-    }
+    });
 }
 
 #[test]
 fn enclosing_bind_does_not_expose_the_symlink_target() {
-    if !supported() {
-        return;
-    }
-    let result = materialize(&Fixture::new(Kind::Directory), true, true);
-    println!("enclosing bind: {result:?}");
-    assert!(
-        result.0 == 23
-            || (result.0 == REFUSED && result.1.contains("mounted grant identity changed")),
-        "the control must show an absent target or an identity refusal: {result:?}"
-    );
+    super::failure_tests::in_fresh_process(|| {
+        if !supported() {
+            return;
+        }
+        let result = materialize(&Fixture::new(Kind::Directory), true, true);
+        println!("enclosing bind: {result:?}");
+        assert!(
+            result.0 == 23
+                || (result.0 == REFUSED && result.1.contains("mounted grant identity changed")),
+            "the control must show an absent target or an identity refusal: {result:?}"
+        );
+    });
 }
 
 fn apply(fixture: &Fixture, config: &ContainmentConfig) -> (i32, String) {
