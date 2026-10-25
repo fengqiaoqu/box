@@ -356,8 +356,8 @@ fn entry_grant(
         ))
     })?;
     if metadata.is_symlink() {
-        // Name the target so the operator can paste it into the grant. A broken link has no
-        // canonical path; say so rather than omit the target.
+        // Name the target so the operator can paste it into the grant. A missing target and a
+        // resolve failure (permission, link loop) are different problems; say which one it is.
         return Err(match lexical.canonicalize() {
             Ok(target) => named(&format!(
                 "{} is a symbolic link to {}. A grant carries the identity the kernel checks,                  so a link renders a rule that matches nothing; name {} instead",
@@ -365,8 +365,12 @@ fn entry_grant(
                 target.display(),
                 target.display()
             )),
-            Err(_) => named(&format!(
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => named(&format!(
                 "{} is a symbolic link whose target is missing. A grant carries the identity                  the kernel checks, so a link renders a rule that matches nothing; repair the                  link or name a path that exists",
+                lexical.display()
+            )),
+            Err(source) => named(&format!(
+                "{} is a symbolic link that cannot be resolved: {source}. A grant carries the                  identity the kernel checks, so a link renders a rule that matches nothing;                  repair the link or name a path that exists",
                 lexical.display()
             )),
         });
@@ -985,6 +989,17 @@ mod tests {
             refusal.contains("symbolic link")
                 && refusal.contains(&text(&broken))
                 && refusal.contains("target is missing"),
+            "{refusal}"
+        );
+
+        // A link that points at itself fails canonicalize with a loop, not NotFound.
+        let looped = home.join("loop-link");
+        std::os::unix::fs::symlink(&looped, &looped).expect("a self link");
+        let refusal = fixture.refusal(&context, &format!("read = [{:?}]", text(&looped)));
+        assert!(
+            refusal.contains("symbolic link")
+                && refusal.contains(&text(&looped))
+                && refusal.contains("cannot be resolved"),
             "{refusal}"
         );
 
